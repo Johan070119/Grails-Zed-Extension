@@ -1,0 +1,27 @@
+{
+    "name": "grails-language-server",
+    "version": "0.1.0",
+    "description": "Grails/Groovy Language Server for Zed (and any LSP-compatible editor)",
+    "main": "dist/server.js",
+    "bin": {
+        "grails-language-server": "dist/server.js"
+    },
+    "scripts": {
+        "compile": "tsc -p tsconfig.json",
+        "watch": "tsc -p tsconfig.json --watch",
+        "clean": "rm -rf dist/"
+    },
+    "dependencies": {
+        "vscode-languageserver": "^9.0.0",
+        "vscode-languageserver-textdocument": "^1.0.0"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "typescript": "^5.0.0"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Johan070119/Grails-Zed-Extension"
+    },
+    "license": "GPL-3.0"
+}
