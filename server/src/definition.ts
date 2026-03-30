@@ -1,338 +1,516 @@
 import * as fs from "fs";
 import * as path from "path";
 import {
+    TextDocumentPositionParams,
     Location,
     Range,
     Position,
-    TextDocumentPositionParams,
-} from "vscode-languageserver/node";
+} from "vscode-languageserver";
 import { TextDocument } from "vscode-languageserver-textdocument";
-import { GrailsProject } from "./grailsProject";
-import { pathToUri } from "./uriUtils";
+import { GrailsProject, DomainClass } from "./grailsProject";
+import { uriToPath, pathToUri } from "./uriUtils";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function locationAt(filePath: string, line: number): Location {
+function toLocation(filePath: string, line = 0, character = 0): Location {
     return {
         uri: pathToUri(filePath),
-        range: Range.create(Position.create(line, 0), Position.create(line, 0)),
+        range: Range.create(
+            Position.create(line, character),
+            Position.create(line, character),
+        ),
     };
 }
 
-function locationAtStart(filePath: string): Location {
-    return locationAt(filePath, 0);
-}
-
-/** Busca la línea de un método en el archivo destino */
-function findMethodLine(filePath: string, methodName: string): number {
-    if (!fs.existsSync(filePath)) return 0;
-    const src = fs.readFileSync(filePath, "utf8");
+function findLine(src: string, pattern: RegExp): number {
     const lines = src.split("\n");
-    const re = new RegExp(
-        "(?:(?:private|protected|public)\\s+)?(?:static\\s+)?(?:def|\\w+)\\s+" +
-            methodName +
-            "\\s*\\(",
-    );
     for (let i = 0; i < lines.length; i++) {
-        if (re.test(lines[i])) return i;
+        if (pattern.test(lines[i])) return i;
     }
     return 0;
 }
 
-/** Busca la línea de una propiedad en el archivo destino */
-function findPropertyLine(filePath: string, propName: string): number {
-    if (!fs.existsSync(filePath)) return 0;
-    const src = fs.readFileSync(filePath, "utf8");
-    const lines = src.split("\n");
-    // Buscar declaración de propiedad: "Tipo nombre" o "def nombre"
-    const re = new RegExp("\\b\\w+\\s+" + propName + "\\b");
-    for (let i = 0; i < lines.length; i++) {
-        if (re.test(lines[i]) && !lines[i].trim().startsWith("//")) return i;
-    }
-    return 0;
-}
-
-/** Intenta inferir el tipo de una variable buscando hacia arriba desde la línea actual */
-function inferVariableType(
-    word: string,
-    lines: string[],
-    currentLine: number,
-    project: GrailsProject,
-): string | null {
-    // Buscar "def varName = SomeClass." o "SomeClass varName ="
-    for (let i = currentLine; i >= Math.max(0, currentLine - 30); i--) {
-        const line = lines[i];
-
-        // def book = Book.findBy...()
-        const defAssign = line.match(
-            new RegExp("def\\s+" + word + "\\s*=\\s*([A-Z]\\w*)\\s*\\."),
-        );
-        if (defAssign) return defAssign[1];
-
-        // Book book = ...
-        const typedDecl = line.match(
-            new RegExp("([A-Z]\\w*)\\s+" + word + "\\s*(?:=|$)"),
-        );
-        if (typedDecl && project.domains.has(typedDecl[1])) return typedDecl[1];
-    }
-    return null;
-}
-
-// ─── Resolvers individuales ───────────────────────────────────────────────────
-
-function resolveArtifactByName(
-    word: string,
-    project: GrailsProject,
-): Location | null {
-    if (project.domains.has(word))
-        return locationAtStart(project.domains.get(word)!.filePath);
-    if (project.controllers.has(word))
-        return locationAtStart(project.controllers.get(word)!.filePath);
-    if (project.services.has(word))
-        return locationAtStart(project.services.get(word)!.filePath);
-    if (project.taglibs.has(word))
-        return locationAtStart(project.taglibs.get(word)!.filePath);
-    return null;
-}
-
-function resolveServiceInjection(
-    line: string,
-    word: string,
-    project: GrailsProject,
-): Location | null {
-    // "def bookService" o "BookService bookService"
-    const m = line.match(/(?:def|[A-Z]\w*)\s+(\w+Service)\b/);
-    if (!m || m[1] !== word) return null;
-    const className = word.charAt(0).toUpperCase() + word.slice(1);
-    const artifact = project.services.get(className);
-    if (!artifact) return null;
-    return locationAtStart(artifact.filePath);
-}
-
-function resolveServiceMethod(
-    word: string,
-    line: string,
-    project: GrailsProject,
-): Location | null {
-    const m = line.match(/(\w+Service)\s*\??\.\s*(\w+)\s*\(/);
-    if (!m || m[2] !== word) return null;
-    const className = m[1].charAt(0).toUpperCase() + m[1].slice(1);
-    const artifact = project.services.get(className);
-    if (!artifact) return null;
-    const lineNo = findMethodLine(artifact.filePath, word);
-    return locationAt(artifact.filePath, lineNo);
-}
-
-function resolveControllerStaticCall(
-    word: string,
-    line: string,
-    project: GrailsProject,
-): Location | null {
-    const m = line.match(/([A-Z]\w*)\s*\.\s*(\w+)\s*\(/);
-    if (!m || m[2] !== word) return null;
-    const className = m[1];
-
-    const ctrl = project.controllers.get(className);
-    if (ctrl) {
-        const lineNo = findMethodLine(ctrl.filePath, word);
-        return locationAt(ctrl.filePath, lineNo);
-    }
-    const svc = project.services.get(className);
-    if (svc) {
-        const lineNo = findMethodLine(svc.filePath, word);
-        return locationAt(svc.filePath, lineNo);
-    }
-    return null;
-}
-
-function resolveGormStaticCall(
-    word: string,
-    line: string,
-    project: GrailsProject,
-): Location | null {
-    const m = line.match(
-        /([A-Z]\w*)\s*\.\s*(?:findBy|findAllBy|countBy|get|list)/,
-    );
-    if (!m) return null;
-    const domain = project.domains.get(m[1]);
-    if (!domain) return null;
-    return locationAtStart(domain.filePath);
-}
-
-function resolveDomainProperty(
-    word: string,
-    line: string,
-    lines: string[],
-    currentLine: number,
-    project: GrailsProject,
-): Location | null {
-    // variable.propiedad o variable?.propiedad
-    const m = line.match(/(\w+)\s*\??\.\s*(\w+)$/);
-    if (!m || m[2] !== word) return null;
-
-    const varName = m[1];
-    const type = inferVariableType(varName, lines, currentLine, project);
-    if (!type) return null;
-
-    const domain = project.domains.get(type);
-    if (!domain) return null;
-
-    const hasProp = domain.properties.some((p) => p.name === word);
-    if (!hasProp && !domain.hasMany[word] && !domain.belongsTo[word])
+function readFile(filePath: string): string | null {
+    try {
+        return fs.readFileSync(filePath, "utf8");
+    } catch {
         return null;
-
-    const lineNo = findPropertyLine(domain.filePath, word);
-    return locationAt(domain.filePath, lineNo);
+    }
 }
 
-function resolveRenderView(
-    line: string,
-    currentFilePath: string,
+function wordAtPosition(
+    doc: TextDocument,
+    params: TextDocumentPositionParams,
+): string {
+    const lines = doc.getText().split("\n");
+    const line = lines[params.position.line] ?? "";
+    const col = params.position.character;
+    let start = col;
+    let end = col;
+    while (start > 0 && /\w/.test(line[start - 1])) start--;
+    while (end < line.length && /\w/.test(line[end])) end++;
+    return line.slice(start, end);
+}
+
+function lineAt(doc: TextDocument, params: TextDocumentPositionParams): string {
+    return doc.getText().split("\n")[params.position.line] ?? "";
+}
+
+// ─── Variable type inference ──────────────────────────────────────────────────
+
+/**
+ * Scans the document above the cursor to find the domain type of a variable.
+ * Handles:
+ *   def area = Area.findByNombre(...)     -> "Area"
+ *   def area = Area.get(id)              -> "Area"
+ *   def areas = Area.findAllBy*(...)     -> "Area"  (list, but domain is Area)
+ *   Area area = ...                      -> "Area"
+ */
+function inferVariableType(
+    varName: string,
+    doc: TextDocument,
+    cursorLine: number,
     project: GrailsProject,
-): Location | null {
-    const m = line.match(/render\s*\(.*?view\s*:\s*['"]([^'"]+)['"]/);
-    if (!m) return null;
+): DomainClass | undefined {
+    const lines = doc.getText().split("\n");
+    const domainNames = [...project.domains.keys()];
 
-    let viewPath = m[1];
-    const viewsRoot = path.join(project.root, "grails-app", "views");
+    // Search upward from cursor, stop at class/method boundary if needed
+    for (let i = cursorLine; i >= 0; i--) {
+        const l = lines[i];
 
-    if (!viewPath.startsWith("/")) {
-        const ctrlMatch = currentFilePath.match(
-            /([A-Za-z]+)Controller\.groovy$/,
-        );
-        if (ctrlMatch) {
-            viewPath =
-                ctrlMatch[1].charAt(0).toLowerCase() +
-                ctrlMatch[1].slice(1) +
-                "/" +
-                viewPath;
+        // "def varName = DomainClass.something(...)"
+        // also handles "def varName = DomainClass?.something(...)"
+        const defMatch = new RegExp(
+            `\\bdef\\s+${varName}\\s*=\\s*([A-Z]\\w+)\\s*[?.]`,
+        ).exec(l);
+        if (defMatch) {
+            const domain = project.domains.get(defMatch[1]);
+            if (domain) return domain;
         }
-    } else {
-        viewPath = viewPath.slice(1);
-    }
 
-    const candidates = [
-        path.join(viewsRoot, viewPath + ".gsp"),
-        path.join(viewsRoot, viewPath),
-    ];
-    for (const c of candidates) {
-        if (fs.existsSync(c)) return locationAtStart(c);
+        // "DomainClass varName = ..." (typed declaration)
+        const typedMatch = new RegExp(`\\b([A-Z]\\w+)\\s+${varName}\\b`).exec(
+            l,
+        );
+        if (typedMatch) {
+            const domain = project.domains.get(typedMatch[1]);
+            if (domain) return domain;
+        }
     }
-    return null;
+    return undefined;
 }
 
-function resolveRenderTemplate(
+// ─── Resolution strategies ────────────────────────────────────────────────────
+
+/**
+ * FIX #5: safe-navigation operator?.
+ * Strips "?." so "area?.id" is treated the same as "area.id"
+ */
+function resolveDomainProperty(
     line: string,
-    currentFilePath: string,
+    word: string,
+    doc: TextDocument,
+    cursorLine: number,
     project: GrailsProject,
+    currentFilePath: string,
 ): Location | null {
-    const m = line.match(/render\s*\(.*?template\s*:\s*['"]([^'"]+)['"]/);
-    if (!m) return null;
+    // Match "varName.prop" OR "varName?.prop" before the cursor word
+    const lineUpToWord = line.slice(0, line.lastIndexOf(word) + word.length);
+    const dotMatch = /\b(\w+)\??\.\s*(\w+)$/.exec(lineUpToWord);
+    if (!dotMatch) return null;
 
-    const tmplName = m[1];
-    const ctrlMatch = currentFilePath.match(/([A-Za-z]+)Controller\.groovy$/);
-    if (!ctrlMatch) return null;
+    const [, varName, propName] = dotMatch;
 
-    const viewDir = path.join(
-        project.root,
-        "grails-app",
-        "views",
-        ctrlMatch[1].charAt(0).toLowerCase() + ctrlMatch[1].slice(1),
-    );
-    const candidates = [
-        path.join(viewDir, "_" + tmplName + ".gsp"),
-        path.join(viewDir, tmplName + ".gsp"),
-    ];
-    for (const c of candidates) {
-        if (fs.existsSync(c)) return locationAtStart(c);
+    // 1. varName is a known domain class directly (Area.someStaticField)
+    let domain =
+        project.domains.get(varName) ??
+        project.domains.get(varName.charAt(0).toUpperCase() + varName.slice(1));
+
+    // 2. varName matches a domain by lowercase name (area -> Area)
+    if (!domain) {
+        domain = [...project.domains.values()].find(
+            (d) => d.name.toLowerCase() === varName.toLowerCase(),
+        );
     }
-    return null;
+
+    // 3. FIX #6: infer from assignment context (def areaPermisos = Area.findAllBy*)
+    if (!domain) {
+        domain = inferVariableType(varName, doc, cursorLine, project);
+    }
+
+    // 4. Controller convention fallback
+    if (!domain) {
+        const ctrlDomainName = path
+            .basename(currentFilePath, ".groovy")
+            .replace(/Controller$/, "");
+        domain = project.domains.get(ctrlDomainName);
+    }
+
+    if (!domain) return null;
+
+    const prop = domain.properties.find((p) => p.name === propName);
+    if (!prop) return null;
+
+    const src = readFile(domain.filePath);
+    if (!src) return null;
+
+    const lineNum = findLine(
+        src,
+        new RegExp(`\\b${prop.type}\\s+${prop.name}\\b`),
+    );
+    return toLocation(domain.filePath, lineNum);
 }
 
+/**
+ * FIX #3 + redirect FIX #2:
+ * redirect(action: 'logIn') without controller: → same controller
+ * redirect(action: 'logIn', controller: 'other') → other controller
+ */
 function resolveRedirect(
     line: string,
-    currentFilePath: string,
     project: GrailsProject,
+    currentFilePath: string,
 ): Location | null {
-    const ctrlMatch = line.match(/controller\s*:\s*['"](\w+)['"]/);
-    const actionMatch = line.match(/action\s*:\s*['"](\w+)['"]/);
+    const ctrlMatch = /controller\s*:\s*['"](\w+)['"]/.exec(line);
+    const actionMatch = /action\s*:\s*['"](\w+)['"]/.exec(line);
 
-    let filePath: string;
+    let targetFilePath: string;
+
     if (ctrlMatch) {
+        // Explicit controller specified
         const ctrlName =
             ctrlMatch[1].charAt(0).toUpperCase() +
             ctrlMatch[1].slice(1) +
             "Controller";
         const artifact = project.controllers.get(ctrlName);
         if (!artifact) return null;
-        filePath = artifact.filePath;
+        targetFilePath = artifact.filePath;
     } else {
-        filePath = currentFilePath;
+        // FIX #2: no controller → same file
+        targetFilePath = currentFilePath;
     }
 
-    if (actionMatch) {
-        const lineNo = findMethodLine(filePath, actionMatch[1]);
-        return locationAt(filePath, lineNo);
-    }
-    return locationAtStart(filePath);
+    if (!actionMatch) return toLocation(targetFilePath);
+
+    const src = readFile(targetFilePath);
+    if (!src) return toLocation(targetFilePath);
+
+    const actionLine = findLine(src, new RegExp(`def\\s+${actionMatch[1]}\\b`));
+    return toLocation(targetFilePath, actionLine);
 }
 
-function resolveGspTag(line: string, project: GrailsProject): Location | null {
-    // <g:render template="row">
-    const tmplM = line.match(/template\s*=\s*['"]([^'"]+)['"]/);
-    if (tmplM) {
-        // Buscar en todas las carpetas de views
-        const viewsRoot = path.join(project.root, "grails-app", "views");
-        const tmplName = tmplM[1];
-        // Búsqueda simple: recorrer views
-        const find = (dir: string): string | null => {
-            if (!fs.existsSync(dir)) return null;
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                const full = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                    const found = find(full);
-                    if (found) return found;
-                } else if (
-                    entry.name === "_" + tmplName + ".gsp" ||
-                    entry.name === tmplName + ".gsp"
-                ) {
-                    return full;
-                }
-            }
-            return null;
-        };
-        const found = find(viewsRoot);
-        if (found) return locationAtStart(found);
-    }
+/**
+ * FIX #3: local method call inside the same controller
+ * renderResponse(...), someMethod(), etc.
+ * Triggered when word is followed by "(" and no dot before it.
+ */
+function resolveLocalMethod(
+    word: string,
+    line: string,
+    currentFilePath: string,
+): Location | null {
+    // Must look like a method call: word followed by ( on the line
+    if (!/\b\w+\s*\(/.test(line)) return null;
+    // Must NOT have a dot before it (that would be a method on an object)
+    const beforeWord = line.slice(0, line.indexOf(word));
+    if (/[\w?]\s*\.\s*$/.test(beforeWord)) return null;
 
-    // controller="book" action="show"
-    const ctrlM = line.match(/controller\s*=\s*['"](\w+)['"]/);
-    const actM = line.match(/action\s*=\s*['"](\w+)['"]/);
-    if (ctrlM) {
-        const ctrlName =
-            ctrlM[1].charAt(0).toUpperCase() + ctrlM[1].slice(1) + "Controller";
-        const artifact = project.controllers.get(ctrlName);
-        if (!artifact) return null;
-        if (actM) {
-            const lineNo = findMethodLine(artifact.filePath, actM[1]);
-            return locationAt(artifact.filePath, lineNo);
-        }
-        return locationAtStart(artifact.filePath);
+    const src = readFile(currentFilePath);
+    if (!src) return null;
+
+    const methodLine = findLine(src, new RegExp(`def\\s+${word}\\b`));
+    // findLine returns 0 if not found — only return if we actually found it
+    const lines = src.split("\n");
+    if (new RegExp(`def\\s+${word}\\b`).test(lines[methodLine])) {
+        return toLocation(currentFilePath, methodLine);
     }
     return null;
 }
 
-function resolveLocalMethod(
-    word: string,
+/**
+ * FIX #1: render(view: '/layouts/main') → grails-app/views/layouts/main.gsp
+ * Absolute path (starts with /) resolves from views root.
+ * Relative path resolves from controller's view folder.
+ */
+function resolveRenderView(
+    line: string,
+    project: GrailsProject,
     currentFilePath: string,
 ): Location | null {
-    if (!fs.existsSync(currentFilePath)) return null;
-    const lineNo = findMethodLine(currentFilePath, word);
-    if (lineNo === 0) return null; // 0 podría ser la clase misma
-    return locationAt(currentFilePath, lineNo);
+    const viewMatch =
+        /render\s*\(\s*(?:view\s*:\s*)?['"]([^'"]+)['"]/.exec(line) ??
+        /render\s+['"]([^'"]+)['"]/.exec(line);
+    if (!viewMatch) return null;
+
+    const viewValue = viewMatch[1];
+    const viewsRoot = path.join(project.root, "grails-app/views");
+    const ctrlName = path
+        .basename(currentFilePath, ".groovy")
+        .replace(/Controller$/, "")
+        .toLowerCase();
+
+    let candidates: string[];
+
+    if (viewValue.startsWith("/")) {
+        // FIX #1: absolute path from views root
+        const stripped = viewValue.replace(/^\//, "");
+        candidates = [
+            path.join(viewsRoot, stripped + ".gsp"),
+            path.join(viewsRoot, stripped), // already has .gsp
+        ];
+    } else {
+        // relative: look in controller's folder first
+        candidates = [
+            path.join(viewsRoot, ctrlName, viewValue + ".gsp"),
+            path.join(viewsRoot, viewValue + ".gsp"),
+            path.join(viewsRoot, ctrlName, `_${viewValue}.gsp`),
+        ];
+    }
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) return toLocation(candidate);
+    }
+    return null;
 }
 
-// ─── Punto de entrada principal ───────────────────────────────────────────────
+function resolveRenderTemplate(
+    line: string,
+    project: GrailsProject,
+    currentFilePath: string,
+): Location | null {
+    const tmplMatch = /template\s*:\s*['"]([^'"]+)['"]/.exec(line);
+    if (!tmplMatch) return null;
+
+    const logicalName = tmplMatch[1].replace(/^_/, "");
+    const ctrlName = path
+        .basename(currentFilePath, ".groovy")
+        .replace(/Controller$/, "")
+        .toLowerCase();
+
+    const candidates = [
+        path.join(
+            project.root,
+            "grails-app/views",
+            ctrlName,
+            `_${logicalName}.gsp`,
+        ),
+        path.join(project.root, "grails-app/views", `_${logicalName}.gsp`),
+    ];
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) return toLocation(candidate);
+    }
+    return null;
+}
+
+/**
+ * Cursor on a method name called on a service variable.
+ * securityService.registerMember(...) → SecurityService.groovy, exact line of method.
+ * Handles: def, private def, typed methods, safe navigation ?.
+ */
+function resolveServiceMethod(
+    word: string,
+    line: string,
+    project: GrailsProject,
+): Location | null {
+    const serviceCallMatch = /\b(\w+Service)\s*\??\.\s*(\w+)\s*\(/.exec(line);
+    if (!serviceCallMatch) return null;
+
+    const [, serviceVar, methodName] = serviceCallMatch;
+    if (word !== methodName) return null;
+
+    const capitalizedService =
+        serviceVar.charAt(0).toUpperCase() + serviceVar.slice(1);
+    const artifact = project.services.get(capitalizedService);
+    if (!artifact) return null;
+
+    const src = readFile(artifact.filePath);
+    if (!src) return null;
+
+    const srcLines = src.split("\n");
+    for (let i = 0; i < srcLines.length; i++) {
+        const l = srcLines[i];
+        // Match: [private|protected|public] [def|Type] methodName(
+        // e.g. "def foo(", "private def foo(", "String foo(", "void foo ("
+        if (
+            new RegExp(
+                `(?:(?:private|protected|public)\\s+)?(?:static\\s+)?(?:def|\\w+)\\s+${methodName}\\s*\\(`,
+            ).test(l)
+        ) {
+            return toLocation(artifact.filePath, i);
+        }
+    }
+    // Method not found but service exists → jump to file top
+    return toLocation(artifact.filePath);
+}
+
+function resolveServiceInjection(
+    word: string,
+    line: string,
+    project: GrailsProject,
+): Location | null {
+    // "BookService bookService" typed declaration
+    const declMatch = /\b([A-Z]\w+Service)\s+\w+/.exec(line);
+    if (declMatch) {
+        const art = project.services.get(declMatch[1]);
+        if (art) return toLocation(art.filePath);
+    }
+    // cursor on "bookService" variable (not a method call)
+    if (/[a-z]\w*Service$/.test(word)) {
+        const capitalized = word.charAt(0).toUpperCase() + word.slice(1);
+        const art = project.services.get(capitalized);
+        if (art) return toLocation(art.filePath);
+    }
+    return null;
+}
+
+/**
+ * Controller static method call: SwaggerController.oauth2Redirect()
+ * Resolves to the exact method line in the controller file.
+ * Handles imported controllers (e.g. import com.example.SwaggerController)
+ */
+function resolveControllerStaticCall(
+    word: string,
+    line: string,
+    project: GrailsProject,
+): Location | null {
+    // Match ClassName.methodName( — checks controllers and services
+    const staticMatch = /\b([A-Z]\w+)\s*\.\s*(\w+)\s*\(/.exec(line);
+    if (!staticMatch) return null;
+
+    const [, className, methodName] = staticMatch;
+    if (word !== methodName) return null;
+
+    // Check controllers first, then services (handles TestService.method() calls)
+    const artifact =
+        project.controllers.get(className) ?? project.services.get(className);
+    if (!artifact) return null;
+
+    const src = readFile(artifact.filePath);
+    if (!src) return toLocation(artifact.filePath);
+
+    const srcLines = src.split("\n");
+    for (let i = 0; i < srcLines.length; i++) {
+        if (
+            new RegExp(
+                `(?:(?:private|protected|public)\\s+)?(?:static\\s+)?(?:def|\\w+)\\s+${methodName}\\s*\\(`,
+            ).test(srcLines[i])
+        ) {
+            return toLocation(artifact.filePath, i);
+        }
+    }
+    return toLocation(artifact.filePath);
+}
+
+/**
+ * GORM static calls: findByX, findAllByX, get, list, count, etc.
+ *
+ * Dynamic finders → extracts the property name and jumps to its declaration:
+ *   Area.findByNombre(x)    → Area.groovy line "String nombre"
+ *   Area.findAllByPadre(x)  → Area.groovy line "String padre" (or whatever type)
+ *
+ * Non-dynamic (get, list, count, save, etc.) → jumps to domain file.
+ */
+function resolveGormStaticCall(
+    word: string,
+    line: string,
+    project: GrailsProject,
+): Location | null {
+    const staticMatch = /\b([A-Z]\w+)\s*\??\.\s*(\w+)\s*\(/.exec(line);
+    if (!staticMatch) return null;
+
+    const [, domainName, methodName] = staticMatch;
+    if (word !== methodName) return null;
+
+    const domain = project.domains.get(domainName);
+    if (!domain) return null;
+
+    // Parse dynamic finder property name:
+    // findByNombre          → "nombre"
+    // findAllByPadre        → "padre"
+    // findByNombreAndTipo   → "nombre" (first property)
+    // countByActivo         → "activo"
+    const dynamicRe =
+        /^(?:findAll?By|listBy|countBy|existsBy|getBy)([A-Z][a-zA-Z]*)/.exec(
+            methodName,
+        );
+    if (dynamicRe) {
+        let rawProp = dynamicRe[1];
+        // Strip trailing compound: "NombreAndTipo" → "Nombre"
+        rawProp = rawProp.replace(/(?:And|Or)[A-Z].*$/, "");
+        const propName = rawProp.charAt(0).toLowerCase() + rawProp.slice(1);
+
+        const prop = domain.properties.find((p) => p.name === propName);
+        if (prop) {
+            const src = readFile(domain.filePath);
+            if (src) {
+                const lineNum = findLine(
+                    src,
+                    new RegExp(`\\b${prop.type}\\s+${prop.name}\\b`),
+                );
+                return toLocation(domain.filePath, lineNum);
+            }
+        }
+    }
+
+    // Fallback: non-dynamic call or property not in index
+    return toLocation(domain.filePath);
+}
+
+function resolveArtifactByName(
+    word: string,
+    project: GrailsProject,
+): Location | null {
+    if (word.endsWith("Controller")) {
+        const art = project.controllers.get(word);
+        if (art) return toLocation(art.filePath);
+    }
+    if (word.endsWith("Service")) {
+        const art = project.services.get(word);
+        if (art) return toLocation(art.filePath);
+    }
+    const domain = project.domains.get(word);
+    if (domain) return toLocation(domain.filePath);
+    return null;
+}
+
+function resolveGspTag(
+    line: string,
+    project: GrailsProject,
+    currentFilePath: string,
+): Location | null {
+    const tmplMatch = /template=['"]([^'"]+)['"]/.exec(line);
+    if (tmplMatch) {
+        const dir = path.dirname(currentFilePath);
+        const logicalName = tmplMatch[1].replace(/^_/, "");
+        const candidate = path.join(dir, `_${logicalName}.gsp`);
+        if (fs.existsSync(candidate)) return toLocation(candidate);
+    }
+
+    const ctrlMatch = /controller=['"](\w+)['"]/.exec(line);
+    const actionMatch = /action=['"](\w+)['"]/.exec(line);
+    if (ctrlMatch) {
+        const ctrlName =
+            ctrlMatch[1].charAt(0).toUpperCase() +
+            ctrlMatch[1].slice(1) +
+            "Controller";
+        const art = project.controllers.get(ctrlName);
+        if (!art) return null;
+        if (!actionMatch) return toLocation(art.filePath);
+        const src = readFile(art.filePath);
+        if (!src) return toLocation(art.filePath);
+        const actionLine = findLine(
+            src,
+            new RegExp(`def\\s+${actionMatch[1]}\\b`),
+        );
+        return toLocation(art.filePath, actionLine);
+    }
+
+    return null;
+}
+
+// ─── Public entry point ───────────────────────────────────────────────────────
 
 export function getDefinition(
     doc: TextDocument,
@@ -341,88 +519,64 @@ export function getDefinition(
 ): Location | null {
     if (!project) return null;
 
-    const text = doc.getText();
-    const lines = text.split("\n");
-    const lineNo = params.position.line;
-    const line = lines[lineNo] ?? "";
-    const offset = doc.offsetAt(params.position);
-    const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
+    const filePath = uriToPath(doc.uri);
+    const word = wordAtPosition(doc, params);
+    const line = lineAt(doc, params);
+    const cursorLine = params.position.line;
+    const isGsp = filePath.endsWith(".gsp");
 
-    // Extraer la palabra bajo el cursor
-    const charIdx = params.position.character;
-    const wordMatch =
-        line.slice(0, charIdx + 1).match(/(\w+)$/) ??
-        line.slice(charIdx).match(/^(\w+)/);
-    const word = wordMatch?.[1] ?? "";
     if (!word) return null;
 
-    const filePath = doc.uri.startsWith("file://")
-        ? decodeURIComponent(doc.uri.replace(/^file:\/\//, ""))
-        : doc.uri;
-
-    // Orden de resolución (mismo que en VS Code)
-
-    // 1. Tags GSP
-    if (filePath.endsWith(".gsp")) {
-        const loc = resolveGspTag(line, project);
-        if (loc) return loc;
+    // 1. GSP-specific tag resolution
+    if (isGsp) {
+        return resolveGspTag(line, project, filePath) ?? null;
     }
 
-    // 2. render view / template
-    if (line.includes("render")) {
-        const loc =
-            resolveRenderView(line, filePath, project) ??
-            resolveRenderTemplate(line, filePath, project);
-        if (loc) return loc;
+    // 2. render(view/template)
+    if (/\brender\b/.test(line)) {
+        return (
+            resolveRenderView(line, project, filePath) ??
+            resolveRenderTemplate(line, project, filePath) ??
+            null
+        );
     }
 
-    // 3. redirect
-    if (line.includes("redirect")) {
-        const loc = resolveRedirect(line, filePath, project);
-        if (loc) return loc;
+    // 3. redirect — FIX: now handles same-controller redirect
+    if (/\bredirect\b/.test(line)) {
+        return resolveRedirect(line, project, filePath) ?? null;
     }
 
-    // 4. Método de servicio: miServicio.miMetodo(
-    {
-        const loc = resolveServiceMethod(word, line, project);
-        if (loc) return loc;
-    }
+    // 4. Service method call (securityService.registerMember)
+    const serviceMethodLoc = resolveServiceMethod(word, line, project);
+    if (serviceMethodLoc) return serviceMethodLoc;
 
-    // 5. Inyección de servicio: def miServicio
-    {
-        const loc = resolveServiceInjection(line, word, project);
-        if (loc) return loc;
-    }
+    // 5. Service injection/variable
+    const serviceLoc = resolveServiceInjection(word, line, project);
+    if (serviceLoc) return serviceLoc;
 
-    // 6. Llamada estática de controller o servicio: MiController.miMetodo(
-    {
-        const loc = resolveControllerStaticCall(word, line, project);
-        if (loc) return loc;
-    }
+    // 6a. Controller static method call (SwaggerController.oauth2Redirect)
+    const ctrlStaticLoc = resolveControllerStaticCall(word, line, project);
+    if (ctrlStaticLoc) return ctrlStaticLoc;
 
-    // 7. GORM estático: Dominio.findBy...
-    {
-        const loc = resolveGormStaticCall(word, line, project);
-        if (loc) return loc;
-    }
+    // 6b. GORM static call (Area.findAllByPadre, Area.get)
+    const gormLoc = resolveGormStaticCall(word, line, project);
+    if (gormLoc) return gormLoc;
 
-    // 8. Propiedad de dominio: variable.propiedad
-    {
-        const loc = resolveDomainProperty(word, line, lines, lineNo, project);
-        if (loc) return loc;
-    }
+    // 7. Domain property with safe-nav support (area?.id, area.id)
+    const propLoc = resolveDomainProperty(
+        line,
+        word,
+        doc,
+        cursorLine,
+        project,
+        filePath,
+    );
+    if (propLoc) return propLoc;
 
-    // 9. Artefacto por nombre de clase
-    {
-        const loc = resolveArtifactByName(word, project);
-        if (loc) return loc;
-    }
+    // 8. Named artifact (BookController, BookService, Book)
+    const artifactLoc = resolveArtifactByName(word, project);
+    if (artifactLoc) return artifactLoc;
 
-    // 10. Método local en el mismo archivo
-    {
-        const loc = resolveLocalMethod(word, filePath);
-        if (loc) return loc;
-    }
-
-    return null;
+    // 9. FIX #3: local method in same controller (renderResponse, any def)
+    return resolveLocalMethod(word, line, filePath) ?? null;
 }

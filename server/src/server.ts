@@ -1,56 +1,46 @@
-#!/usr/bin/env node
-/**
- * Grails Language Server — punto de entrada LSP.
- *
- * Se comunica con el editor (Zed, VS Code, Neovim, etc.) mediante
- * el protocolo LSP estándar vía stdio.
- *
- * NO importa nada de "vscode" — solo vscode-languageserver (protocolo puro).
- */
-
 import {
     createConnection,
-    TextDocuments,
     ProposedFeatures,
-    InitializeParams,
+    TextDocuments,
     TextDocumentSyncKind,
+    InitializeParams,
     InitializeResult,
-    CompletionParams,
-    DefinitionParams,
+    CompletionItem,
+    TextDocumentPositionParams,
+    DidChangeWatchedFilesParams,
+    FileChangeType,
+    Location,
 } from "vscode-languageserver/node";
-
 import { TextDocument } from "vscode-languageserver-textdocument";
-
 import { GrailsIndexer } from "./indexer";
 import { getCompletions } from "./completion";
 import { getDefinition } from "./definition";
-
-// ─── Conexión LSP ─────────────────────────────────────────────────────────────
+import { uriToPath } from "./uriUtils";
 
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
-const indexer = new GrailsIndexer();
+const indexer = new GrailsIndexer(connection);
 
-// ─── Inicialización ───────────────────────────────────────────────────────────
+// ─── Initialize ───────────────────────────────────────────────────────────────
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
-    const folders = (params.workspaceFolders ?? []).map((f) =>
-        decodeURIComponent(f.uri.replace(/^file:\/\//, "")),
-    );
+    const folders = params.workspaceFolders?.map((f) => uriToPath(f.uri)) ?? [];
 
-    // Indexar el proyecto en background (no bloquea la inicialización)
-    setImmediate(() => indexer.initialize(folders));
+    if (folders.length > 0) {
+        indexer.initialize(folders);
+    } else if (params.rootUri) {
+        indexer.initialize([uriToPath(params.rootUri)]);
+    } else if (params.rootPath) {
+        indexer.initialize([params.rootPath]);
+    }
 
     return {
         capabilities: {
             textDocumentSync: TextDocumentSyncKind.Incremental,
-
-            // Autocompletado — caracteres trigger:
-            //   "."  → instancias / métodos / propiedades
-            //   "("  → parámetros
-            //   ":"  → named args (view:, model:, action:)
-            //   A–Z  → nombres de clase (artefactos Grails)
             completionProvider: {
+                resolveProvider: false,
+                // Trigger on structural chars + uppercase letters (for domain/class names)
+                // Uppercase letters trigger completion for "def x = Fu" → Fusion, etc.
                 triggerCharacters: [
                     ".",
                     "(",
@@ -82,53 +72,56 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
                     "Y",
                     "Z",
                 ],
-                resolveProvider: false,
             },
-
-            // Go-to-Definition (Ctrl+Click en Zed)
             definitionProvider: true,
+            workspace: {
+                workspaceFolders: { supported: true },
+            },
+        },
+        serverInfo: {
+            name: "Grails Language Server",
+            version: "1.0.0",
         },
     };
 });
 
-connection.onInitialized(() => {
-    process.stderr.write("[Grails] Language server initialized.\n");
-});
+// ─── Completions ──────────────────────────────────────────────────────────────
 
-connection.onShutdown(() => {
-    indexer.dispose();
-});
+connection.onCompletion(
+    (params: TextDocumentPositionParams): CompletionItem[] => {
+        const doc = documents.get(params.textDocument.uri);
+        if (!doc) return [];
 
-// ─── Notificaciones de cambio de archivo ─────────────────────────────────────
+        const project = indexer.getProject();
+        return getCompletions(doc, params, project);
+    },
+);
 
-connection.onDidChangeWatchedFiles((params) => {
+// ─── Go to Definition ─────────────────────────────────────────────────────────
+
+connection.onDefinition(
+    (params: TextDocumentPositionParams): Location | null => {
+        const doc = documents.get(params.textDocument.uri);
+        if (!doc) return null;
+        return getDefinition(doc, params, indexer.getProject());
+    },
+);
+
+// ─── File watching ────────────────────────────────────────────────────────────
+
+connection.onDidChangeWatchedFiles((params: DidChangeWatchedFilesParams) => {
     for (const change of params.changes) {
-        const filePath = decodeURIComponent(
-            change.uri.replace(/^file:\/\//, ""),
-        );
-        if (filePath.endsWith(".groovy")) {
-            indexer.onFileChanged(filePath);
+        if (change.type !== FileChangeType.Deleted) {
+            indexer.onFileChanged(uriToPath(change.uri));
         }
     }
 });
 
-// ─── Autocompletado ───────────────────────────────────────────────────────────
+// ─── Lifecycle ────────────────────────────────────────────────────────────────
 
-connection.onCompletion((params: CompletionParams) => {
-    const doc = documents.get(params.textDocument.uri);
-    if (!doc) return [];
-    return getCompletions(doc, params, indexer.getProject());
+connection.onShutdown(() => {
+    indexer.dispose();
 });
-
-// ─── Go-to-Definition ─────────────────────────────────────────────────────────
-
-connection.onDefinition((params: DefinitionParams) => {
-    const doc = documents.get(params.textDocument.uri);
-    if (!doc) return null;
-    return getDefinition(doc, params, indexer.getProject());
-});
-
-// ─── Arranque ─────────────────────────────────────────────────────────────────
 
 documents.listen(connection);
 connection.listen();

@@ -1,20 +1,16 @@
-name = "Groovy"
-grammar = "groovy"
-path_suffixes = ["groovy"]
-line_comments = ["// "]
-block_comment = { start = "/*", end = "*/" }
+name = "GSP"
+grammar = "html"
+path_suffixes = ["gsp"]
+line_comments = ["<%-- ", " --%>"]
 autoclose_before = ");:,|"
 brackets = [
   { start = "{", end = "}", close = true, newline = true },
   { start = "[", end = "]", close = true, newline = false },
   { start = "(", end = ")", close = true, newline = false },
+  { start = "<", end = ">", close = false, newline = false },
   { start = "\"", end = "\"", close = true, newline = false },
   { start = "'", end = "'", close = true, newline = false },
 ]
-word_characters = ["@", "$"]
-prettier_parser_name = "groovy"
-
-# Indentation: 4 espacios (convención Grails/Groovy)
 tab_size = 4
 
 [[language_servers]]

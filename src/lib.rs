@@ -85,8 +85,8 @@ impl zed::Extension for GrailsExtension {
         &mut self,
         _language_server_id: &LanguageServerId,
         _worktree: &Worktree,
-    ) -> Result<Option<serde_json::Value>> {
-        Ok(Some(serde_json::json!({
+    ) -> Result<Option<zed::serde_json::Value>> {
+        Ok(Some(zed::serde_json::json!({
             "trace": "off"
         })))
     }

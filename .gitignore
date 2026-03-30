@@ -1,3 +1,18 @@
+# Node
 server/node_modules/
 server/dist/
+
+# Rust build
 target/
+
+# WASM compilado (output final)
+*.wasm
+
+# Logs / temp
+*.log
+*.tmp
+*.cache
+
+# OS
+.DS_Store
+Thumbs.db

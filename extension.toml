@@ -2,10 +2,14 @@ id = "grails"
 name = "Grails Support"
 version = "0.1.0"
 schema_version = 1
-authors = ["Johan Mixtega Cisneros <johan070119@gmail.com>"]
+authors = ["Johan Mixtega Cisneros <jcismixtega@gmail.com>"]
 description = "Grails/Groovy language support for Zed — autocompletion, go-to-definition, project navigation. Compatible with Grails 2.x through 7+."
 repository = "https://github.com/Johan070119/Grails-Zed-Extension"
 
 [language_servers.grails-lsp]
 name = "Grails Language Server"
 languages = ["Groovy", "GSP"]
+
+[grammars.groovy]
+repository = "https://github.com/murtaza64/tree-sitter-groovy"
+rev = "86911590a8e46d71301c66468e5620d9faa5b6af"

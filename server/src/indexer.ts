@@ -1,135 +1,131 @@
 import * as fs from "fs";
 import * as path from "path";
-import { buildGrailsProject, GrailsProject } from "./grailsProject";
-
-const DEBOUNCE_MS = 300;
+import { Connection } from "vscode-languageserver/node";
+import {
+    GrailsProject,
+    GrailsVersion,
+    buildGrailsProject,
+    findGrailsRoot,
+    isGrailsProject,
+} from "./grailsProject";
 
 export class GrailsIndexer {
     private project: GrailsProject | null = null;
     private watchers: fs.FSWatcher[] = [];
-    private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    private connection: Connection;
+    private rebuildTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /**
-     * Encuentra la raíz del proyecto Grails y construye el índice inicial.
-     * Se llama desde onInitialize del servidor LSP.
-     */
+    constructor(connection: Connection) {
+        this.connection = connection;
+    }
+
+    // ─── Public API ───────────────────────────────────────────────────────────
+
     initialize(workspaceFolders: string[]): void {
         for (const folder of workspaceFolders) {
-            const root = this.findGrailsRoot(folder);
+            const root = isGrailsProject(folder)
+                ? folder
+                : findGrailsRoot(folder);
             if (root) {
-                process.stderr.write(
-                    "[Grails] Project found at: " + root + "\n",
+                this.connection.console.log(
+                    `[Grails] Project found at: ${root}`,
                 );
                 this.index(root);
                 this.watchProject(root);
                 return;
             }
         }
-        process.stderr.write(
-            "[Grails] No grails-app/ directory found in workspace.\n",
+        this.connection.console.log(
+            "[Grails] No Grails project found in workspace.",
         );
     }
 
-    /** Devuelve el proyecto indexado o null si aún no hay proyecto. */
+    onFileChanged(changedPath: string): void {
+        if (!this.project) return;
+        if (!changedPath.endsWith(".groovy")) return;
+
+        if (this.rebuildTimer) clearTimeout(this.rebuildTimer);
+        this.rebuildTimer = setTimeout(() => {
+            this.connection.console.log(
+                `[Grails] Re-indexing after change: ${path.basename(changedPath)}`,
+            );
+            this.index(this.project!.root);
+        }, 300);
+    }
+
     getProject(): GrailsProject | null {
         return this.project;
     }
 
-    /** Fuerza una re-indexación (usable desde tests). */
-    reindex(): void {
-        if (this.project) {
-            this.index(this.project.root);
-        }
-    }
-
-    /** Detiene todos los watchers de archivo. */
     dispose(): void {
         for (const w of this.watchers) {
             try {
                 w.close();
-            } catch {
-                /* ignorar */
-            }
+            } catch {}
         }
         this.watchers = [];
-        if (this.debounceTimer) clearTimeout(this.debounceTimer);
     }
 
-    // ─── Internos ─────────────────────────────────────────────────────────────
-
-    private findGrailsRoot(folder: string): string | null {
-        const grailsApp = path.join(folder, "grails-app");
-        if (fs.existsSync(grailsApp)) return folder;
-
-        // Buscar un nivel de profundidad (monorepos)
-        if (!fs.existsSync(folder)) return null;
-        for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
-            if (entry.isDirectory()) {
-                const sub = path.join(folder, entry.name, "grails-app");
-                if (fs.existsSync(sub)) return path.join(folder, entry.name);
-            }
-        }
-        return null;
-    }
+    // ─── Private ──────────────────────────────────────────────────────────────
 
     private index(root: string): void {
         try {
             this.project = buildGrailsProject(root);
-            const p = this.project;
-            process.stderr.write(
-                "[Grails] Indexed (v" +
-                    p.version +
-                    ")" +
-                    " — " +
-                    p.domains.size +
-                    " domains" +
-                    ", " +
-                    p.controllers.size +
-                    " controllers" +
-                    ", " +
-                    p.services.size +
-                    " services" +
-                    ", " +
-                    p.taglibs.size +
-                    " taglibs\n",
-            );
-        } catch (err) {
-            process.stderr.write(
-                "[Grails] Indexing error: " + String(err) + "\n",
-            );
+            this.logStats();
+        } catch (e) {
+            this.connection.console.error(`[Grails] Indexing error: ${e}`);
         }
     }
 
+    private logStats(): void {
+        if (!this.project) return;
+        const { domains, controllers, services, taglibs, version } =
+            this.project;
+        this.connection.console.log(
+            `[Grails] Indexed (v${version}) — ` +
+                `${domains.size} domains, ${controllers.size} controllers, ` +
+                `${services.size} services, ${taglibs.size} taglibs`,
+        );
+    }
+
+    /**
+     * Watch directories for .groovy changes.
+     * Grails 2:  only grails-app subdirs
+     * Grails 3+: also src/main/groovy (may contain domain classes)
+     */
     private watchProject(root: string): void {
+        const version: GrailsVersion = this.project?.version ?? "unknown";
+
         const dirsToWatch = [
-            path.join(root, "grails-app", "domain"),
-            path.join(root, "grails-app", "controllers"),
-            path.join(root, "grails-app", "services"),
-            path.join(root, "grails-app", "taglib"),
-            path.join(root, "src", "main", "groovy"),
+            "grails-app/domain",
+            "grails-app/controllers",
+            "grails-app/services",
+            "grails-app/taglib",
         ];
 
-        for (const dir of dirsToWatch) {
+        // Grails 3+ additional source dirs
+        if (version !== "2") {
+            dirsToWatch.push("src/main/groovy");
+        }
+
+        for (const rel of dirsToWatch) {
+            const dir = path.join(root, rel);
             if (!fs.existsSync(dir)) continue;
             try {
-                const w = fs.watch(dir, { recursive: true }, (_, filename) => {
-                    if (!filename?.endsWith(".groovy")) return;
-                    this.onFileChanged(filename);
-                });
-                this.watchers.push(w);
+                const watcher = fs.watch(
+                    dir,
+                    { recursive: true },
+                    (_event, filename) => {
+                        if (filename?.endsWith(".groovy")) {
+                            this.onFileChanged(path.join(dir, filename));
+                        }
+                    },
+                );
+                this.watchers.push(watcher);
             } catch {
-                /* dir no soporta watch (ej. fs virtual) */
+                // fs.watch with recursive:true not supported on all platforms
+                // (notably Linux requires inotify). Fail silently.
             }
         }
-    }
-
-    onFileChanged(changedPath: string): void {
-        if (this.debounceTimer) clearTimeout(this.debounceTimer);
-        this.debounceTimer = setTimeout(() => {
-            process.stderr.write(
-                "[Grails] Re-indexing after change: " + changedPath + "\n",
-            );
-            if (this.project) this.index(this.project.root);
-        }, DEBOUNCE_MS);
     }
 }
