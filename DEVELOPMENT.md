@@ -1,19 +1,25 @@
 # Guía de Desarrollo — Grails Support for Zed
 
 ## Estructura del repositorio
-
 ```
 grails-zed-extension/
 │
 ├── extension.toml          ← Manifiesto principal (id, name, version)
 ├── Cargo.toml              ← Crate Rust compilado a WASM
+├── grammars/
+│   └── groovy.wasm         ← Grammar Tree-sitter precompilado para Groovy
+│
 ├── src/
 │   └── lib.rs              ← Lógica WASM: instala y lanza el servidor LSP
 │
 ├── languages/
 │   ├── groovy/
 │   │   ├── config.toml     ← Configuración del lenguaje Groovy en Zed
-│   │   └── highlights.scm  ← Reglas Tree-sitter de resaltado
+│   │   ├── highlights.scm  ← Reglas Tree-sitter de resaltado
+│   │   ├── brackets.scm    ← Resaltado de brackets coincidentes
+│   │   ├── indents.scm     ← Reglas de indentación automática
+│   │   ├── injections.scm  ← Inyección de lenguajes embebidos
+│   │   └── outline.scm     ← Símbolos para el panel de outline
 │   └── gsp/
 │       ├── config.toml     ← Configuración del lenguaje GSP
 │       └── highlights.scm  ← Reglas Tree-sitter de resaltado
@@ -32,30 +38,65 @@ grails-zed-extension/
 
 ---
 
-## Setup inicial
+## Instalación desde el repositorio (para probar la extensión)
 
+### Requisitos
+
+- [Zed](https://zed.dev) 0.140.0 o superior
+- [Rust](https://rustup.rs) (via rustup)
+- Node.js 18+
+
+### Pasos
 ```bash
-# Requisitos: Rust (via rustup), Node.js 18+, Zed editor
-
+# 1. Clonar el repositorio
 git clone https://github.com/Johan070119/Grails-Zed-Extension
 cd Grails-Zed-Extension
 
-# Instalar dependencias del servidor LSP
+# 2. Instalar dependencias del servidor LSP
 cd server && npm install && cd ..
-
-# Compilar el servidor LSP
-cd server && npm run compile && cd ..
-
-# (Opcional) Compilar el WASM — Zed lo hace automáticamente al instalar la dev extension
-# cargo build --target wasm32-wasip1 --release
 ```
+
+El servidor LSP (`grails-language-server`) está publicado en npm y Zed lo
+descargará automáticamente la primera vez que abras un proyecto Grails.
+No es necesario compilarlo ni instalarlo manualmente.
+```bash
+# 3. Instalar como dev extension en Zed
+#    Zed compilará el WASM automáticamente
+```
+
+En Zed: `Extensions → Install Dev Extension` → seleccionar la carpeta del repositorio.
+
+### Verificar que funciona
+
+Abre un proyecto Grails en Zed y revisa los logs:
+```bash
+cat ~/.local/share/zed/logs/Zed.log | grep -i "grails" | tail -15
+```
+
+Deberías ver:
+```
+[Grails] Project found at: /tu/proyecto
+[Grails] Indexed (v2) — 80 domains, 3 controllers, 22 services, 0 taglibs
+```
+
+### Notas importantes sobre el resaltado de sintaxis
+
+El grammar de Groovy (`grammars/groovy.wasm`) está incluido en el repositorio
+precompilado. Zed lo usa directamente sin necesidad de descargarlo.
+
+El grammar proviene de [murtaza64/tree-sitter-groovy](https://github.com/murtaza64/tree-sitter-groovy)
+y tiene algunas limitaciones conocidas:
+
+- Los comentarios de bloque `/* */` con el formato `* */` (espacio antes del cierre)
+  pueden interrumpir el resaltado. Usa siempre `*/` sin espacio.
+- El código comentado entre bloques `catch` puede causar pérdida de resaltado.
+  Elimina el código comentado o muévelo fuera del bloque try/catch.
 
 ---
 
 ## Ciclo de desarrollo
 
 ### Cambios en el servidor LSP (TypeScript — lo más frecuente)
-
 ```bash
 cd server
 
@@ -73,7 +114,6 @@ Después de recompilar, recargar la extensión en Zed:
 
 Zed recompila automáticamente el WASM al instalar la dev extension.
 Para forzar una recompilación:
-
 ```bash
 # Instalar el target WASM si no está
 rustup target add wasm32-wasip1
@@ -83,26 +123,22 @@ cargo build --target wasm32-wasip1 --release
 ```
 
 ### Ver logs del servidor LSP
-
 ```bash
-# Arrancar Zed en foreground para ver todos los logs
-zed --foreground
+# Ver logs en tiempo real
+cat ~/.local/share/zed/logs/Zed.log | grep -i "grails" | tail -20
 
-# Los logs del servidor aparecen como:
-# [Grails] Project found at: /tu/proyecto
-# [Grails] Indexed (v2) — 80 domains, 3 controllers, 22 services, 0 taglibs
-# [Grails] Re-indexing after change: BookController.groovy
+# O arrancar Zed en foreground para ver todos los logs
+zed --foreground
 ```
 
 ---
 
 ## Agregar logging temporal para debug
 
-En cualquier archivo `.ts` del servidor, usar **`process.stderr.write`**:
-
+En cualquier archivo `.ts` del servidor, usar **`connection.console.log`**:
 ```typescript
-// ✅ Correcto
-process.stderr.write("[DEBUG] kind=" + ctx.kind + " line=" + lineUpTo + "\n");
+// ✅ Correcto — usa el canal de logging del LSP
+connection.console.log("[DEBUG] kind=" + ctx.kind);
 
 // ❌ Evitar console.log — puede interferir con el protocolo LSP en stdio
 ```
@@ -119,7 +155,6 @@ process.stderr.write("[DEBUG] kind=" + ctx.kind + " line=" + lineUpTo + "\n");
 6. Verificar que no rompe los casos de camelCase existentes
 
 ### Trampa crítica: regexes en template literals
-
 ```typescript
 // ✅ Correcto en template literal (doble backslash)
 new RegExp(`(?:def|\\w+)\\s+${methodName}\\s*\\(`)
@@ -134,7 +169,15 @@ new RegExp(`\\b${methodName}\\s*\\(`)  // BUG silencioso
 
 1. Actualizar `version` en `extension.toml`
 2. Actualizar `version` en `server/package.json`
-3. Publicar el servidor en npm: `cd server && npm publish`
+3. Agregar el shebang al servidor compilado y publicar en npm:
+```bash
+cd server
+npm run compile
+echo '#!/usr/bin/env node' | cat - dist/server.js > /tmp/server_tmp.js && mv /tmp/server_tmp.js dist/server.js
+chmod +x dist/server.js
+npm publish
+```
+
 4. Abrir PR en [zed-industries/extensions](https://github.com/zed-industries/extensions) actualizando el submodule y la versión en `extensions.toml`
 
 ---
@@ -161,7 +204,6 @@ El árbol de proyecto y los comandos se pueden configurar en Zed via `tasks.json
 ## Tasks de Zed (equivalente a los comandos CLI de VS Code)
 
 Añadir en `.zed/tasks.json` dentro del proyecto Grails:
-
 ```json
 [
   {
